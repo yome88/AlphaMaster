@@ -1,9 +1,8 @@
 """实时信号引擎：多品种 / 多周期并发调度。
 
-- 每个「监控项」= (数据源, 品种, 周期, 策略因子)。
-- 后台线程按周期自适应节奏轮询，出现新 bar 才重算，信号取最后已收盘 bar。
-- 共享 (源,品种,周期) 的 K 线抓取结果做短 TTL 缓存，避免重复请求。
-- 监控清单持久化到 web_settings，重启恢复。
+A股适配：
+  - _next_bar_close_at 增加 A股交易时间判断（非交易时段不显示虚假倒计时）
+  - 通达信数据源已加入前端可见列表
 """
 from __future__ import annotations
 
@@ -51,11 +50,42 @@ def _cadence_for(tf: str) -> int:
     return _CADENCE.get(tf, _DEFAULT_CADENCE)
 
 
-def _next_bar_close_at(last_bar_open: int | None, timeframe: str, now: float | None = None) -> int | None:
+def _is_a_share_source(source_kind: str) -> bool:
+    """判断是否为 A 股数据源。"""
+    return source_kind in ("tongdaxin",)
+
+
+def _is_a_share_trade_time(now: float | None = None) -> bool:
+    """判断当前是否处于 A 股交易时段（仅判断时间，忽略节假日）。"""
+    try:
+        from config import Config
+        return Config.is_a_share_trade_time(
+            int(now) if now is not None else None
+        )
+    except Exception:
+        return False
+
+
+def _is_a_share_trade_day(now: float | None = None) -> bool:
+    """判断当前是否为 A 股交易日（周一到周五）。"""
+    try:
+        from config import Config
+        return Config.is_a_share_trade_day(
+            int(now) if now is not None else None
+        )
+    except Exception:
+        return True  # 默认假设是交易日
+
+
+def _next_bar_close_at(
+    last_bar_open: int | None,
+    timeframe: str,
+    now: float | None = None,
+    source_kind: str | None = None,
+) -> int | None:
     """根据最后已收盘 bar 的开盘时间，推算下次收盘（即下次信号更新）的 Unix 秒。
 
-    若最后一根已收盘 bar 已过时太久（超过约 2 个周期仍无新 bar），视为休市/断档，
-    返回 None，避免在周末等时段虚构「几分钟后更新」的倒计时。
+    A股适配：若非交易时段，返回 None（不显示虚假倒计时）。
     """
     if last_bar_open is None:
         return None
@@ -63,15 +93,24 @@ def _next_bar_close_at(last_bar_open: int | None, timeframe: str, now: float | N
     if not period:
         return None
     now_i = int(now if now is not None else time.time())
+
+    # A股：非交易时段直接返回 None
+    if source_kind and _is_a_share_source(source_kind):
+        if not _is_a_share_trade_day(now_i):
+            return None
+        # 日线级别无需判断具体时段，日内周期（1m/5m/15m/30m/1h）需判断
+        if period < 86400 and not _is_a_share_trade_time(now_i):
+            return None
+
     last_open = int(last_bar_open)
     last_close = last_open + period
-    # 仍未到收盘（常见于 MT5 终端时钟快于本机、或未剔除形成中 bar）
+    # 仍未到收盘
     if last_close > now_i:
         return last_close
-    # 正常交易中：上一根收盘距今至多约 1 个周期；再放宽到 2 个周期容错拉取延迟
+    # 正常交易中：上一根收盘距今至多约 1 个周期；再放宽到 2 个周期容错
     if now_i - last_close > period * 2:
         return None
-    # last_open 开盘 → last_close 收盘；当前形成中的 bar 在 +2*period 收盘
+    # 推算下一根收盘
     nxt = last_open + 2 * period
     while nxt <= now_i:
         nxt += period
@@ -81,7 +120,7 @@ def _next_bar_close_at(last_bar_open: int | None, timeframe: str, now: float | N
 
 
 def _ensure_closed_bars(bars: list, timeframe: str, now: float | None = None) -> list:
-    """按本机时钟再剔掉尚未收盘的 K 线（防止 MT5 时钟偏快时把形成中 bar 当已收盘）。"""
+    """按本机时钟再剔掉尚未收盘的 K 线。"""
     period = _TF_SECONDS.get(timeframe)
     if not period or not bars:
         return bars
@@ -120,7 +159,7 @@ class WatchTask:
     best_score: float | None
     cadence_s: int
     # 运行时状态
-    state: str = "pending"          # pending|ok|insufficient|error
+    state: str = "pending"
     direction: str | None = None
     strength: float | None = None
     position: float | None = None
@@ -135,7 +174,9 @@ class WatchTask:
 
     def to_public(self) -> dict[str, Any]:
         now = time.time()
-        next_close = _next_bar_close_at(self.last_bar_ts, self.timeframe, now)
+        next_close = _next_bar_close_at(
+            self.last_bar_ts, self.timeframe, now, source_kind=self.source
+        )
         live = next_close is not None
         return {
             "id": self.id,
@@ -185,7 +226,6 @@ class RealtimeManager:
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rt")
         self._inflight: set[str] = set()
         self._inflight_lock = threading.Lock()
-        # K线缓存：(kind,symbol,tf) -> (monotonic_ts, bars)
         self._bar_cache: dict[tuple[str, str, str], tuple[float, list]] = {}
         self._loaded = False
         self._tv_blocked_until = 0.0
@@ -247,6 +287,10 @@ class RealtimeManager:
             warn = f"词表版本不符（{meta['vocab_version']} vs {VOCAB_VERSION}），信号可能失真"
         elif meta.get("symbol") and meta["symbol"] != symbol:
             warn = f"该因子为 {meta['symbol']} 训练，跨品种运行仅供参考"
+
+        # A股适配：跨市场警告
+        if _is_a_share_source(source) and meta.get("symbol") and not meta.get("symbol", "").upper().startswith(("SH", "SZ", "6", "0", "3", "68", "30")):
+            warn = f"策略品种 {meta.get('symbol')} 非 A 股，通达信运行可能无数据"
 
         task = WatchTask(
             id=task_id,
@@ -333,12 +377,11 @@ class RealtimeManager:
                 if task.id in self._inflight:
                     continue
                 self._inflight.add(task.id)
-            # 预置下次到期，避免重复提交
             task.next_due = now + task.cadence_s
             self._executor.submit(self._evaluate_task, task)
 
     def _get_bars(self, source: str, symbol: str, timeframe: str):
-        """带短 TTL 缓存的 K 线抓取（同一 源/品种/周期 的多因子复用）。"""
+        """带短 TTL 缓存的 K 线抓取。"""
         key = (source, symbol, timeframe)
         ttl = max(10.0, _cadence_for(timeframe) * 0.8)
         now = time.monotonic()
@@ -359,7 +402,13 @@ class RealtimeManager:
                 return
             last_ts = bars[-1].ts
             raw = bars_to_raw_dict(bars)
-            result = evaluate_signal(task.formula, raw)
+
+            # A股适配：仅做多
+            from config import Config
+            symbol = task.symbol
+            allow_short = Config.allow_short(symbol)
+
+            result = evaluate_signal(task.formula, raw, allow_short=allow_short)
 
             task.state = result.get("state", "error")
             task.message = result.get("message", "")
@@ -374,11 +423,9 @@ class RealtimeManager:
                 task.position = result["position"]
                 task.factor_value = result["factor_value"]
                 task.history.append(round(result["strength"], 4))
-                # 已有上次方向且发生转折时推飞书（首次算出方向不打扰）
                 if prev_dir and new_dir and prev_dir != new_dir:
                     try:
                         from web.feishu_notify import notify_direction_flip
-
                         notify_direction_flip(
                             symbol=task.symbol,
                             timeframe=task.timeframe,
@@ -398,7 +445,6 @@ class RealtimeManager:
                         TV_CONNECTIVITY_BLOCKED,
                         check_tradingview_connectivity,
                     )
-
                     now_m = time.monotonic()
                     if now_m < self._tv_blocked_until:
                         msg = TV_CONNECTIVITY_BLOCKED
