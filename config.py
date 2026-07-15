@@ -1,10 +1,17 @@
-"""
-config.py — 统一配置模块（项目根目录）
+"""config.py — 统一配置模块（项目根目录）
 
 所有子模块从此文件导入 Config，废弃各自的 config.py。
 MT5 连接凭证通过环境变量或 .env 文件加载。
+
+A股适配修改（2026-07-11）：
+  - 新增 A_SHARE_SYMBOLS / A_SHARE_TRAINABLE_SYMBOLS / A_SHARE_FEATURE_SYMBOLS
+  - 新增 MARKET_TYPE 自动判断（a_share / forex）
+  - 新增 A股交易成本（印花税、过户费、佣金）
+  - 新增 A股交易时间处理（9:30-11:30, 13:00-15:00）
+  - 新增 A股仅做多模式（ALLOW_SHORT = False）
 """
 import os
+import re
 
 try:
     import MetaTrader5 as mt5
@@ -35,116 +42,219 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# ── A股相关工具函数 ──────────────────────────────────────────
+
+def _is_a_share_symbol(symbol: str) -> bool:
+    """判断是否为 A 股品种。
+
+    支持格式：
+      - 纯数字代码：6xxxxx（上海）/ 0xxxxx/3xxxxx（深圳）/ 68xxxxx（科创）/ 30xxxxx（创业板）
+      - 带前缀：SH600519 / SZ000001 / sz300750
+    """
+    s = (symbol or "").strip().upper().replace(".", "")
+    # 纯数字
+    if s.isdigit() and len(s) == 6:
+        return True
+    # SH/SZ 前缀
+    if s.startswith("SH") and len(s) == 8 and s[2:].isdigit():
+        return True
+    if s.startswith("SZ") and len(s) == 8 and s[2:].isdigit():
+        return True
+    return False
+
+
+def detect_market_type(symbol: str) -> str:
+    """根据品种代码自动判断市场类型。
+
+    Returns:
+        'a_share' — A 股（含指数）
+        'forex'   — 外汇/贵金属/美股/加密等
+    """
+    if _is_a_share_symbol(symbol):
+        return "a_share"
+    return "forex"
+
+
 class Config:
     # ── MT5 连接 ──────────────────────────────────────────
     MT5_LOGIN    = int(os.getenv("MT5_LOGIN", "0"))
     MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
     MT5_SERVER   = os.getenv("MT5_SERVER", "")
 
-    # ── 品种与周期 ────────────────────────────────────────
-    # TRADE_SYMBOLS：实际交易的品种（新账号，无 m 后缀）
-    SYMBOLS   = [
+    # ── 市场类型切换 ────────────────────────────────────
+    # 设为 'a_share' 则全局使用 A 股参数；'auto' 按品种自动判断；'forex' 保持原行为
+    MARKET_TYPE = os.getenv("MARKET_TYPE", "auto")
+
+    # ── 做空权限 ──────────────────────────────────────────
+    # A 股普通账户不支持做空（融券/股指期货除外），训练时仅使用做多信号
+    ALLOW_SHORT_FOREX = True
+    ALLOW_SHORT_A_SHARE = False
+
+    @classmethod
+    def allow_short(cls, symbol: str | None = None) -> bool:
+        """根据当前品种/市场类型返回是否允许做空。"""
+        mt = cls.MARKET_TYPE
+        if mt == "a_share":
+            return cls.ALLOW_SHORT_A_SHARE
+        if mt == "forex":
+            return cls.ALLOW_SHORT_FOREX
+        if symbol is None:
+            # auto 且无 symbol 时保守返回 True（回测可统一处理）
+            return cls.ALLOW_SHORT_FOREX
+        return cls.ALLOW_SHORT_A_SHARE if _is_a_share_symbol(symbol) else cls.ALLOW_SHORT_FOREX
+
+    # ── 品种与周期（外汇/贵金属/美股）────────────────────────
+    SYMBOLS_FOREX = [
         # 外汇
         "EURUSD", "USDJPY",
         # 贵金属
         "XAUUSD", "XAGUSD",
-        # AAVUSD 已移除：实为 Aave 加密货币，非大宗商品。波动特征与贵金属完全不匹配。
-        # COCOA.c 已移除：大宗商品期货，日交易~10h，时间对齐后仅8546 bar，
-        # 拖累整组数据量，且流动性/交易时段与贵金属不匹配。
         # 美国指数
         "US30.cash", "US100.cash", "US500.cash", "US2000.cash",
         # 其他指数
         "JP225.cash",
     ]
 
-    # ── 训练品种（单品种模式）──────────────────────────────
-    # 2026-07-07 从分组模式切换到单品种模式。原因：
-    #   1. 截面信息没用上：precious_metals/index 跑出的4个最优公式，没有一个用了 CS 算子
-    #   2. 跨品种干扰严重：XAUUSD/XAGUSD 同组时，白银 Kyle Lambda 波动是黄金4倍，
-    #      模型被白银主导，黄金信号被淹没
-    #   3. 指数组无效探索：5个美股指数相关性>0.85，截面空间狭窄，19次重启后仍是beta
-    #   4. 单品种策略更纯粹：因子只针对一种资产特征，实盘也更容易管理
-    # 每个品种独立训练，checkpoint 按 ckpt_{symbol}_step_{N}.pt 保存。
-    TRAINABLE_SYMBOLS = [
-        # 外汇（各8年数据，24h连续交易）
-        "EURUSD",
-        "USDJPY",
-        # 贵金属（8年数据，24h连续交易）
+    TRAINABLE_SYMBOLS_FOREX = [
+        "EURUSD", "USDJPY",
         "XAUUSD",
-        # XAGUSD 已移除：白银与黄金高度相关，单品种训练收益有限，
-        # 且黄金已有验证策略(Sharpe 2.66)，优先覆盖未挖掘品种
-        # 美国指数（各5年数据）
-        "US30.cash",
-        "US100.cash",
-        "US500.cash",
-        "US2000.cash",
-        # 日本指数
+        "US30.cash", "US100.cash", "US500.cash", "US2000.cash",
         "JP225.cash",
     ]
 
     # [deprecated] 相关性分组（已废弃，改用 TRAINABLE_SYMBOLS 单品种训练）
-    # 保留供回测参考，新训练不再使用
-    SYMBOL_GROUPS = {
+    SYMBOL_GROUPS_FOREX = {
         "forex":          ["EURUSD", "USDJPY"],
         "precious_metals":["XAUUSD", "XAGUSD"],
         "index":          ["US30.cash", "US100.cash", "US500.cash", "US2000.cash", "JP225.cash"],
     }
 
-    # FEATURE_SYMBOLS：用于计算截面特征的宽品种集
-    # 包含主要外汇、贵金属、大宗商品、主流指数，时间与 SYMBOLS 高度对齐
-    # REL_RET5/REL_RET20/REL_VOL 等跨资产特征将基于这 40 个品种计算截面均值
-    # 若设为 None，则退化为只用 SYMBOLS（5品种截面）
-    FEATURE_SYMBOLS = [
-        # 主要外汇（26个）
+    FEATURE_SYMBOLS_FOREX = [
         "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDCAD", "USDCHF",
         "USDJPY", "EURJPY", "GBPJPY", "AUDJPY", "EURGBP", "EURAUD",
         "EURCAD", "EURCHF", "GBPAUD", "GBPCAD", "GBPCHF",
         "AUDCAD", "AUDCHF", "AUDNZD", "NZDCAD", "NZDCHF", "NZDJPY",
         "CADCHF", "CADJPY", "CHFJPY",
-        # 贵金属（3个）
         "XAUUSD", "XAGUSD", "XPTUSD",
-        # 美元指数（1个）
         "DXY.cash",
-        # 大宗商品（2个）
         "USOIL.cash", "UKOIL.cash",
-        # 主流指数（8个）
         "US30.cash", "US500.cash", "US100.cash", "UK100.cash",
         "DE30.cash", "FR40.cash", "JP225.cash", "AUS200.cash",
     ]
 
+    # ── A 股品种列表 ──────────────────────────────────────
+    # 蓝筹股示例（可用于训练/回测/实时监控）
+    A_SHARE_SYMBOLS = [
+        # 大盘蓝筹
+        "SH600519",   # 贵州茅台
+        "SH601318",   # 中国平安
+        "SH600036",   # 招商银行
+        "SH601888",   # 中国中免
+        # 中小盘
+        "SZ000001",   # 平安银行
+        "SZ000858",   # 五粮液
+        "SZ002594",   # 比亚迪
+        # 创业板/科创板
+        "SZ300750",   # 宁德时代
+        "SH688981",   # 中芯国际
+        # 指数
+        "SH000001",   # 上证指数
+        "SZ399006",   # 创业板指
+        "SH000300",   # 沪深300
+    ]
+
+    A_SHARE_TRAINABLE_SYMBOLS = [
+        "SH600519", "SH601318", "SH600036",
+        "SZ000001", "SZ000858", "SZ002594",
+        "SZ300750", "SH688981",
+        "SH000001", "SZ399006", "SH000300",
+    ]
+
+    A_SHARE_FEATURE_SYMBOLS = [
+        "SH600519", "SH601318", "SH600036", "SH601888",
+        "SZ000001", "SZ000858", "SZ002594", "SZ300750",
+        "SH688981", "SH000001", "SZ399006", "SH000300",
+    ]
+
+    # 兼容旧代码：默认使用外汇品种（单品种训练时由调用方传入具体品种）
+    SYMBOLS = SYMBOLS_FOREX
+    TRAINABLE_SYMBOLS = TRAINABLE_SYMBOLS_FOREX
+    SYMBOL_GROUPS = SYMBOL_GROUPS_FOREX
+    FEATURE_SYMBOLS = FEATURE_SYMBOLS_FOREX
+
+    @classmethod
+    def get_symbols(cls, market_type: str | None = None) -> list[str]:
+        """根据市场类型返回对应的品种列表。"""
+        mt = market_type or cls.MARKET_TYPE
+        if mt == "a_share":
+            return cls.A_SHARE_SYMBOLS
+        return cls.SYMBOLS_FOREX
+
+    @classmethod
+    def get_trainable_symbols(cls, market_type: str | None = None) -> list[str]:
+        mt = market_type or cls.MARKET_TYPE
+        if mt == "a_share":
+            return cls.A_SHARE_TRAINABLE_SYMBOLS
+        return cls.TRAINABLE_SYMBOLS_FOREX
+
+    @classmethod
+    def get_feature_symbols(cls, market_type: str | None = None) -> list[str]:
+        mt = market_type or cls.MARKET_TYPE
+        if mt == "a_share":
+            return cls.A_SHARE_FEATURE_SYMBOLS
+        return cls.FEATURE_SYMBOLS_FOREX
+
     # ── 数据参数 ──────────────────────────────────────────
-    TIMEFRAME             = mt5.TIMEFRAME_H1   # K 线周期
-    # 每品种拉取的历史 K 线上限。设为极大值以使用 MT5 全部可用历史；
-    # 本地缓存优先：若 D:\K线数据 已有数据，fetcher 会返回本地全部历史（不截断）。
+    TIMEFRAME             = mt5.TIMEFRAME_H1   # K 线周期（外汇默认 H1）
+    A_SHARE_TIMEFRAME     = mt5.TIMEFRAME_D1   # A 股默认日线（日线更适合 A 股）
     BARS_COUNT            = 10_000_000
-    MIN_BARS              = 3000   # 低于此值的品种被排除
-    DATA_REFRESH_INTERVAL = 300    # 秒，实盘数据刷新间隔
-    KLINE_CACHE_DIR       = os.getenv("KLINE_CACHE_DIR", r"D:\K线数据")  # 本地 K 线缓存目录
+    MIN_BARS              = 3000
+    DATA_REFRESH_INTERVAL = 300
+    KLINE_CACHE_DIR       = os.getenv("KLINE_CACHE_DIR", r"D:\K线数据")
+    A_SHARE_CACHE_DIR     = os.getenv("A_SHARE_CACHE_DIR", r"D:\K线数据\A股")
 
     # ── 模型参数（仅供参考，训练实际使用 model_core.config.ModelConfig）────
-    # 训练参数的权威来源是 model_core/config.py，这里的值不生效
-    INPUT_DIM       = 20           # 特征数（与 MT5FeatureEngineer.INPUT_DIM 一致）
-    BATCH_SIZE      = 128          # 参见 ModelConfig.BATCH_SIZE
-    TRAIN_STEPS     = 300          # 参见 ModelConfig.TRAIN_STEPS
-    MAX_FORMULA_LEN = 8            # 参见 ModelConfig.MAX_FORMULA_LEN
-    # DEVICE 同样以 model_core/config.py 为准（已改为 cpu，原因见该文件注释）
+    INPUT_DIM       = 20
+    BATCH_SIZE      = 128
+    TRAIN_STEPS     = 300
+    MAX_FORMULA_LEN = 8
     DEVICE          = (
         torch.device("cpu")
         if _TORCH_AVAILABLE
         else "cpu"
     )
 
-    # ── 风控参数 ──────────────────────────────────────────
-    RISK_PER_TRADE     = 0.01      # legacy: 保留给旧接口/测试；实盘仓位使用 VOL_TARGET_* 参数
-    COST_RATE          = 0.0001    # 单边点差+佣金（forex/metals）
-    MAX_OPEN_POSITIONS = 4         # 最多同时持仓品种数
-    MAX_LOT_PER_TRADE  = 5.0       # 兜底上限；实际手数由 XAUUSD 0.01 手波动预算决定
-    # 永不自动交易的品种（白银合约乘数 5000，2026-07-08 起停用）
+    # ── 风控参数（外汇默认值）──────────────────────────────
+    RISK_PER_TRADE     = 0.01
+    COST_RATE_FOREX    = 0.0001     # 单边点差+佣金（forex/metals，约 0.01%）
+    MAX_OPEN_POSITIONS = 4
+    MAX_LOT_PER_TRADE  = 5.0
     EXCLUDED_TRADE_SYMBOLS = ["XAGUSD"]
-    # 手数校准（实盘）：
-    # - 以 XAUUSD 0.01 手的一根 ATR 美元波动作为基准
-    # - 其它品种按各自 ATR 与 tick value 反推手数，使金额波动接近
-    # - 可选 Sharpe 权重：Sharpe 高于基准则略放大，低于基准则收缩
+
+    # ── A 股交易成本（万分之级别）──────────────────────────
+    # 印花税：卖出时 0.05%（单边）
+    # 过户费：上海 0.001%（双边），深圳免
+    # 佣金：约 0.025%（双边），最低 5 元
+    # 总单边成本 ≈ 0.025% + 0.001% = 0.026%（买入）；卖出额外 +0.05% 印花税
+    # 简化模型：统一 cost_rate 取 0.00035（0.035%）≈ 买卖合计平均
+    COST_RATE_A_SHARE        = 0.00035   # 单边综合费率（佣金+过户费，不含印花税）
+    A_SHARE_STAMP_TAX        = 0.0005    # 印花税（仅卖出，0.05%）
+    A_SHARE_TRANSFER_FEE     = 0.00001   # 过户费（0.001%，上海）
+    A_SHARE_COMMISSION       = 0.00025   # 佣金（0.025%）
+    A_SHARE_MIN_COMMISSION   = 5.0       # 最低佣金 5 元（实盘用，回测忽略）
+
+    @classmethod
+    def get_cost_rate(cls, symbol: str | None = None) -> float:
+        """根据品种/市场类型返回适用的单边成本率。"""
+        mt = cls.MARKET_TYPE
+        if mt == "a_share":
+            return cls.COST_RATE_A_SHARE
+        if mt == "forex":
+            return cls.COST_RATE_FOREX
+        if symbol is None:
+            return cls.COST_RATE_FOREX
+        return cls.COST_RATE_A_SHARE if _is_a_share_symbol(symbol) else cls.COST_RATE_FOREX
+
     FIXED_LOT_BY_SYMBOL = {
         "XAUUSD": 0.01,
     }
@@ -162,37 +272,28 @@ class Config:
         "US30.cash": 0.923,
         "JP225.cash": -0.653,
     }
-    MIN_TRADE_EXPOSURE = 0.05      # |tanh(factor)| 小于该值时视为空仓，回测/实盘共用
+    MIN_TRADE_EXPOSURE = 0.05
 
     # ── 策略参数 ──────────────────────────────────────────
-    # SIGNAL_MODE 控制信号→仓位的转换方式：
-    #   "backtest_parity": tanh 连续仓位，与 backtest.py 完全一致（推荐）
-    #   "threshold":       sigmoid + BUY_THRESHOLD / SELL_THRESHOLD（旧逻辑）
     SIGNAL_MODE = "backtest_parity"
-
-    # EXIT_MODE 控制出场机制：
-    #   "signal":  仅靠信号翻转出场，严格对标回测
-    #   "risk":    保留止损/止盈/追踪止损
-    #   "hybrid":  信号翻转为主，保留紧急熔断（单日最大亏损 / 极端滑点）
     EXIT_MODE = "signal"
-
-    # threshold 模式专用（SIGNAL_MODE="threshold" 时生效）
     BUY_THRESHOLD       = 0.70
     SELL_THRESHOLD      = 0.40
-
-    # risk / hybrid 模式专用（EXIT_MODE != "signal" 时生效）
-    STOP_LOSS_PCT       = -0.02   # -2%
-    TAKE_PROFIT_PCT     = 0.04    # +4%
+    STOP_LOSS_PCT       = -0.02
+    TAKE_PROFIT_PCT     = 0.04
     TRAILING_ACTIVATION = 0.03
     TRAILING_DROP       = 0.015
-
-    # 时间对齐
-    REBALANCE_ON_BAR_CLOSE = True  # True=仅新 K 线收盘后调仓，对标回测
-    EXECUTION_LAG_BARS     = 1     # 与回测 target_ret 的执行延迟对齐
-
-    # 持仓上限：None = 不限制（严格对标回测，各品种独立）
-    # 设为整数（如 3）则启用约束（需回测里同步加同样约束才对标）
+    REBALANCE_ON_BAR_CLOSE = True
+    EXECUTION_LAG_BARS     = 1
     MAX_OPEN_POSITIONS: int | None = None
+
+    # ── A 股交易时间（Unix 秒，北京时间 UTC+8）──────────────
+    # 用于实时分析时判断是否在交易时段内
+    A_SHARE_TRADE_HOURS = {
+        "morning": (9 * 3600 + 30 * 60, 11 * 3600 + 30 * 60),   # 09:30 - 11:30
+        "afternoon": (13 * 3600 + 0 * 60, 15 * 3600 + 0 * 60),   # 13:00 - 15:00
+    }
+    A_SHARE_TZ_OFFSET = 8 * 3600  # UTC+8
 
     # ── 文件路径 ──────────────────────────────────────────
     STRATEGY_FILE  = "best_mt5_strategy.json"
@@ -207,15 +308,6 @@ class Config:
         """将字符串（如 'H1'）映射为 MT5 时间周期常量。
 
         支持的周期：M1, M5, M15, M30, H1, H4, D1, W1, MN1
-
-        Args:
-            tf_str: 时间周期字符串，例如 "H1"
-
-        Returns:
-            对应的 MT5 TIMEFRAME_* 整数常量
-
-        Raises:
-            ValueError: 若 tf_str 不在支持列表中
         """
         mapping = {
             "M1":  mt5.TIMEFRAME_M1,
@@ -234,3 +326,33 @@ class Config:
                 f"Supported values: {list(mapping.keys())}"
             )
         return mapping[tf_str]
+
+    # ── A 股辅助方法 ──────────────────────────────────────
+    @classmethod
+    def is_a_share_trade_time(cls, timestamp: int | None = None) -> bool:
+        """判断给定 Unix 时间戳是否处于 A 股交易时段（仅考虑小时，忽略节假日）。
+
+        Args:
+            timestamp: Unix 秒，默认取当前时间
+        """
+        import time as _time
+        ts = timestamp if timestamp is not None else int(_time.time())
+        # 转换为北京时间当日秒数
+        local_sec = (ts + cls.A_SHARE_TZ_OFFSET) % 86400
+        for start, end in cls.A_SHARE_TRADE_HOURS.values():
+            if start <= local_sec <= end:
+                return True
+        return False
+
+    @classmethod
+    def is_a_share_trade_day(cls, timestamp: int | None = None) -> bool:
+        """判断是否为 A 股交易日（周一至周五，忽略节假日）。
+
+        注意：未内置交易所休市日历，需外部数据源或手动维护 holiday list。
+        """
+        import time as _time
+        from datetime import datetime as _datetime, timezone as _timezone
+        ts = timestamp if timestamp is not None else int(_time.time())
+        dt = _datetime.fromtimestamp(ts, tz=_timezone.utc)
+        # 周一=0 ... 周五=4
+        return dt.weekday() <= 4
