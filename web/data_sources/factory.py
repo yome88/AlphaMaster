@@ -1,14 +1,18 @@
-"""数据源工厂 + 单例注册（复用连接）。"""
+"""数据源工厂 + 单例注册（复用连接）。
+
+A股适配：将 tongdaxin（通达信）加入前端可见数据源列表。
+"""
 from __future__ import annotations
 
 import threading
 
 from web.data_sources.base import DataSource
 
-# 前端下拉可见的数据源（okx / tongdaxin 实现保留，暂不展示）
+# 前端下拉可见的数据源（A股适配：加入通达信）
 SOURCE_KINDS: tuple[tuple[str, str], ...] = (
     ("mt5", "MT5"),
     ("tradingview", "TradingView"),
+    ("tongdaxin", "通达信（A股）"),
 )
 
 _INSTANCES: dict[str, DataSource] = {}
